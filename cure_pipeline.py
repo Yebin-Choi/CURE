@@ -7,6 +7,7 @@ Colab에서 순서대로 검증한 로직을 스크립트 하나로 정리한 �
 """
 
 import json
+import os
 import subprocess
 import time
 
@@ -50,6 +51,40 @@ DEEPPK_KEY_MAP = {
 
 
 # ── 공용 유틸 ────────────────────────────────────────────────
+RETRY_DELAYS = (2, 4, 8, 16)  # 초 단위 지수 백오프 (총 5회 시도)
+
+
+def _with_retry(fn, label, delays=RETRY_DELAYS):
+    # ChEMBL/ADMET-AI/Deep-PK 외부 서버 500/404/타임아웃 대응.
+    # label에 화합물/단계 정보를 담아 실패 시 어디서 죽었는지 로그로 남긴다.
+    last_exc = None
+    for attempt, delay in enumerate((0,) + delays, start=1):
+        if delay:
+            print(f"  [재시도 {attempt - 1}/{len(delays)}] {label} — {delay}초 대기 후 재시도")
+            time.sleep(delay)
+        try:
+            return fn()
+        except Exception as e:
+            last_exc = e
+            print(f"  [에러] {label} 실패 (시도 {attempt}/{len(delays) + 1}): {type(e).__name__}: {e}")
+    raise RuntimeError(f"{label} — {len(delays) + 1}회 시도 모두 실패: {last_exc}") from last_exc
+
+
+def _work_path(compound_key, filename):
+    # mmpdb 산출물은 화합물별 디렉터리로 분리해 배치 실행 시 파일 충돌을 방지한다.
+    d = os.path.join("mmpdb_work", str(compound_key))
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, filename)
+
+
+def _run_mmpdb(args, label):
+    try:
+        subprocess.run(args, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        print(f"  [mmpdb 실패] {label}\n    cmd: {' '.join(args)}\n    stderr: {e.stderr}")
+        raise
+
+
 def desalt(smiles):
     # 대이온(counter-ion) 제거
     mol = Chem.MolFromSmiles(smiles)
@@ -79,9 +114,13 @@ def get_sa_score(smiles):
 def poll_deeppk(job_id, delay=5):
     # 진행중(dict)/완료(이중 인코딩 문자열) 둘 다 처리
     while True:
-        r = requests.get(
-            "https://biosig.lab.uq.edu.au/deeppk/api/predict",
-            files={"job_id": (None, job_id)},
+        r = _with_retry(
+            lambda: requests.get(
+                "https://biosig.lab.uq.edu.au/deeppk/api/predict",
+                files={"job_id": (None, job_id)},
+                timeout=30,
+            ),
+            label=f"Deep-PK 폴링(job_id={job_id})",
         )
         parsed = r.json()
         if isinstance(parsed, dict) and parsed.get("status") == "running":
@@ -91,30 +130,44 @@ def poll_deeppk(job_id, delay=5):
 
 
 def deeppk_predict(smiles, key):
-    resp = requests.post(
-        "https://biosig.lab.uq.edu.au/deeppk/api/predict",
-        files={"smiles": (None, smiles), "pred_type": (None, "toxicity")},
+    resp = _with_retry(
+        lambda: requests.post(
+            "https://biosig.lab.uq.edu.au/deeppk/api/predict",
+            files={"smiles": (None, smiles), "pred_type": (None, "toxicity")},
+            timeout=30,
+        ),
+        label=f"Deep-PK 예측 요청(smiles={smiles[:30]}...)",
     )
-    return poll_deeppk(resp.json()["job_id"])["0"][key]
+    result = poll_deeppk(resp.json()["job_id"])
+    if not isinstance(result, dict) or "0" not in result or key not in result["0"]:
+        actual = list(result.get("0", {}).keys()) if isinstance(result, dict) and "0" in result else result
+        raise KeyError(f"Deep-PK 응답에 예상 키({key!r}) 없음. 실제 응답 구조: {actual}")
+    return result["0"][key]
 
 
 # ── Agent 0: 타겟 자동탐색 ───────────────────────────────────
 def get_chembl_id(drug_name):
     hits = molecule.search(drug_name)
-    return hits[0]["molecule_chembl_id"] if hits else None
+    first = _with_retry(lambda: hits[0] if hits else None, label=f"ChEMBL ID 조회: {drug_name}")
+    return first["molecule_chembl_id"] if first else None
 
 
 def get_target_from_mechanism(chembl_id):
     hits = mechanism.filter(molecule_chembl_id=chembl_id)
-    return hits[0] if hits else None
+    return _with_retry(lambda: hits[0] if hits else None, label=f"타겟 메커니즘 조회: {chembl_id}")
 
 
 def get_target_name(target_chembl_id):
-    return target.get(target_chembl_id)["pref_name"]
+    return _with_retry(
+        lambda: target.get(target_chembl_id)["pref_name"], label=f"타겟명 조회: {target_chembl_id}"
+    )
 
 
 def get_smiles(chembl_id):
-    raw = molecule.get(chembl_id)["molecule_structures"]["canonical_smiles"]
+    raw = _with_retry(
+        lambda: molecule.get(chembl_id)["molecule_structures"]["canonical_smiles"],
+        label=f"SMILES 조회: {chembl_id}",
+    )
     return desalt(raw)
 
 
@@ -151,7 +204,10 @@ def get_own_activity(molecule_chembl_id, target_chembl_id):
         standard_units="nM",
         pchembl_value__isnull=False,
     ).only(["standard_value"])
-    values = [float(h["standard_value"]) for h in hits if h["standard_value"] is not None]
+    resolved = _with_retry(
+        lambda: list(hits), label=f"자체 활성값 조회: {molecule_chembl_id}/{target_chembl_id}"
+    )
+    values = [float(h["standard_value"]) for h in resolved if h["standard_value"] is not None]
     return min(values) if values else None
 
 
@@ -162,7 +218,8 @@ def get_target_activities(target_chembl_id, limit=2000):
         standard_units="nM",
         pchembl_value__isnull=False,
     ).only(["standard_value"])[:limit]
-    return [float(h["standard_value"]) for h in hits if h["standard_value"] is not None]
+    resolved = _with_retry(lambda: list(hits), label=f"타겟 활성값 분포 조회: {target_chembl_id}")
+    return [float(h["standard_value"]) for h in resolved if h["standard_value"] is not None]
 
 
 def potency_percentile(own_value, population_values):
@@ -209,7 +266,7 @@ def run_agent0_1(drug_name):
     mech = get_target_from_mechanism(chembl_id)
     target_id = mech["target_chembl_id"] if mech else None
     smiles = get_smiles(chembl_id)
-    preds = model.predict(smiles=smiles)
+    preds = _with_retry(lambda: model.predict(smiles=smiles), label=f"ADMET-AI 예측: {drug_name}")
     return {
         "chembl_id": chembl_id,
         "target_id": target_id,
@@ -226,14 +283,18 @@ def get_similar_compounds(smiles, threshold=70):
     hits = similarity.filter(smiles=smiles, similarity=threshold).only(
         ["molecule_chembl_id", "similarity"]
     )
-    return list(hits)
+    return _with_retry(lambda: list(hits), label=f"유사 화합물 검색(threshold={threshold})")
 
 
 def get_similar_smiles(similar_compounds):
     result = []
     for c in similar_compounds:
-        raw = molecule.get(c["molecule_chembl_id"])["molecule_structures"]["canonical_smiles"]
-        result.append((desalt(raw), c["molecule_chembl_id"]))
+        cid = c["molecule_chembl_id"]
+        raw = _with_retry(
+            lambda cid=cid: molecule.get(cid)["molecule_structures"]["canonical_smiles"],
+            label=f"유사 화합물 SMILES 조회: {cid}",
+        )
+        result.append((desalt(raw), cid))
     return result
 
 
@@ -249,33 +310,50 @@ def dedup_against_query(pairs, query_smiles):
 
 
 def run_agent2(smiles, chembl_id, property_name):
+    # mmpdb 산출물은 화합물(chembl_id)별 디렉터리에 써서 배치 실행 시 파일 충돌을 피한다.
+    compounds_path = _work_path(chembl_id, "compounds.smi")
+    fragdb_path = _work_path(chembl_id, "fragments.fragdb")
+    mmpdb_path = _work_path(chembl_id, "mmp.db")
+    props_path = _work_path(chembl_id, "props.txt")
+
     similar = get_similar_compounds(smiles, threshold=70)
     pairs = get_similar_smiles(similar)
     deduped = dedup_against_query(pairs, smiles)
     all_compounds = [(smiles, chembl_id)] + deduped
 
-    with open("compounds.smi", "w") as f:
+    with open(compounds_path, "w") as f:
         for smi, cid in all_compounds:
             f.write(f"{smi}\t{cid}\n")
-    subprocess.run(["mmpdb", "fragment", "compounds.smi", "-o", "fragments.fragdb"], check=True)
-    subprocess.run(["mmpdb", "index", "fragments.fragdb", "-o", "mmp.db"], check=True)
+    _run_mmpdb(
+        ["mmpdb", "fragment", compounds_path, "-o", fragdb_path],
+        label=f"fragment({chembl_id})",
+    )
+    _run_mmpdb(["mmpdb", "index", fragdb_path, "-o", mmpdb_path], label=f"index({chembl_id})")
 
-    batch_preds = model.predict(smiles=[s for s, _ in all_compounds])
-    with open("props.txt", "w") as f:
+    batch_preds = _with_retry(
+        lambda: model.predict(smiles=[s for s, _ in all_compounds]),
+        label=f"ADMET-AI 배치 예측: {chembl_id} 비교군 {len(all_compounds)}개",
+    )
+    with open(props_path, "w") as f:
         f.write(f"ID\t{property_name}\n")
         for (s, cid), val in zip(all_compounds, batch_preds[property_name]):
             f.write(f"{cid}\t{val}\n")
-    subprocess.run(["mmpdb", "loadprops", "-p", "props.txt", "mmp.db"], check=True)
+    _run_mmpdb(
+        ["mmpdb", "loadprops", "-p", props_path, mmpdb_path],
+        label=f"loadprops({chembl_id})",
+    )
 
 
 # ── Agent 3: 구조 변형 제안 ───────────────────────────────────
-def run_agent3(smiles, property_name):
-    subprocess.run(
-        ["mmpdb", "transform", "--smiles", smiles, "mmp.db",
-         "--property", property_name, "-o", "transform_results.csv"],
-        check=True,
+def run_agent3(smiles, chembl_id, property_name):
+    mmpdb_path = _work_path(chembl_id, "mmp.db")
+    results_path = _work_path(chembl_id, "transform_results.csv")
+    _run_mmpdb(
+        ["mmpdb", "transform", "--smiles", smiles, mmpdb_path,
+         "--property", property_name, "-o", results_path],
+        label=f"transform({chembl_id})",
     )
-    df = pd.read_csv("transform_results.csv", sep="\t")
+    df = pd.read_csv(results_path, sep="\t")
     avg_col = f"{property_name}_avg"
     count_col = f"{property_name}_count"
     return df.sort_values(avg_col)[["SMILES", avg_col, count_col]].reset_index(drop=True)
@@ -306,14 +384,24 @@ def run_agent4_5(smiles, variants, property_name):
 
 # ── 마스터 파이프라인 ─────────────────────────────────────────
 def run_full_pipeline(drug_name, top_n_steps=(5, 15, 30)):
-    diag = run_agent0_1(drug_name)
+    try:
+        diag = run_agent0_1(drug_name)
+    except Exception as e:
+        raise RuntimeError(f"[{drug_name}] Agent0-1(진단) 단계 실패: {e}") from e
     if diag is None:
         return {"status": "타겟_판단불가"}
     if diag["property_name"] is None:
         return {"status": "독성_문제_없음", "진단": diag}
 
-    run_agent2(diag["smiles"], diag["chembl_id"], diag["property_name"])
-    all_variants = run_agent3(diag["smiles"], diag["property_name"])
+    try:
+        run_agent2(diag["smiles"], diag["chembl_id"], diag["property_name"])
+    except Exception as e:
+        raise RuntimeError(f"[{drug_name}] Agent2(MMP DB 구축) 단계 실패: {e}") from e
+
+    try:
+        all_variants = run_agent3(diag["smiles"], diag["chembl_id"], diag["property_name"])
+    except Exception as e:
+        raise RuntimeError(f"[{drug_name}] Agent3(구조 변형 제안) 단계 실패: {e}") from e
 
     checked = 0
     for n in top_n_steps:
@@ -321,7 +409,12 @@ def run_full_pipeline(drug_name, top_n_steps=(5, 15, 30)):
         checked = n
         if len(new_batch) == 0:
             continue
-        ranked = run_agent4_5(diag["smiles"], new_batch, diag["property_name"])
+        try:
+            ranked = run_agent4_5(diag["smiles"], new_batch, diag["property_name"])
+        except Exception as e:
+            raise RuntimeError(
+                f"[{drug_name}] Agent4-5(재검증+랭킹) 단계 실패 (후보 {checked}개 확인 중): {e}"
+            ) from e
         if len(ranked) > 0:
             return {
                 "status": "완료",
@@ -334,18 +427,26 @@ def run_full_pipeline(drug_name, top_n_steps=(5, 15, 30)):
 
 
 def run_batch(drug_names):
-    # 여러 화합물 순차 실행, 하나 에러 나도 중단 없이 기록만 남기고 계속
+    # 여러 화합물 순차 실행(파일 충돌 방지를 위해 병렬화하지 않음).
+    # 하나 에러 나도 중단 없이 기록만 남기고 계속 진행.
     results = {}
     for name in drug_names:
+        print(f"=== {name} 실행 시작 ===")
         try:
             results[name] = run_full_pipeline(name)
         except Exception as e:
+            print(f"[배치 에러] {name}: {e}")
             results[name] = {"status": "에러", "message": str(e)}
     return results
 
 
 if __name__ == "__main__":
-    # 검증됐던 화합물 3개로 기본 동작 확인
-    batch_results = run_batch(["Cisapride", "Troglitazone", "Bromfenac"])
+    # 검증됐던 3개(Cisapride, Troglitazone, Bromfenac) + hERG/DILI 사례 + 안전 대조군
+    batch_results = run_batch([
+        "Cisapride", "Troglitazone", "Bromfenac",
+        "Terfenadine", "Astemizole",       # hERG 계열
+        "Trovafloxacin",                   # DILI 계열
+        "Metformin", "Amoxicillin", "Loratadine", "Ibuprofen",  # 안전 대조군
+    ])
     for name, r in batch_results.items():
         print(name, "->", r.get("status"), "| 문제축:", r.get("타겟문제"))
