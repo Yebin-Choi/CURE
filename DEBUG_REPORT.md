@@ -122,7 +122,59 @@ print(pd.DataFrame(rows, columns=["화합물", "상태", "문제축", "통과후
 설치**(Repository access에 `CURE` 추가, Contents: Read and write 권한 포함)해야 했다. 이후
 정상적으로 브랜치 push가 됐다. 같은 문제를 겪는다면 이 경로부터 확인하는 게 빠르다.
 
-## 6. 다음 단계 제안
+## 6. 오프라인 모의 배치 테스트 (`mock_harness.py`)
+
+ChEMBL/Deep-PK를 실제로 못 부르는 대신, **ChEMBL/ADMET-AI/Deep-PK 호출부만 합성 데이터로
+대체하고 RDKit·mmpdb(실제 CLI 서브프로세스)·pandas 로직은 `cure_pipeline.py`의 진짜 코드를
+그대로 실행하는 모의 하네스**(`mock_harness.py`)를 만들어 12~13개 화합물로 전체 파이프라인을
+돌려봤다. 실제 화합물의 알려진 SMILES를 등록하고, 여기서 간단한 원자/그룹 치환으로 "유사
+화합물" analog를 만들어 mmpdb가 실제로 매칭쌍을 찾을 수 있게 했다.
+
+### 발견한 버그 2개 — 모두 `mock_harness.py`(모의 계층) 버그, `cure_pipeline.py`는 정상
+
+1. **`molecule.get()` 목 구현의 analog 조회 버그**: analog 화합물 ID로 조회했는데 항상 원본
+   화합물의 SMILES를 반환하고 있었다. 그 결과 "유사 화합물"이 전부 쿼리 자기 자신과 동일 구조로
+   판정되어 `dedup_against_query()`가 (정상적으로!) 전부 걸러내 버려서, 모든 화합물이
+   `통과_후보_없음`으로 나왔다. → `mock_harness.py`의 `FakeEndpoint.get()` 수정.
+2. **SMILES 정규화 불일치**: 목 레지스트리에 손으로 입력한 SMILES 문자열이 RDKit의 canonical
+   form과 정확히 일치하지 않는 경우, `get_smiles()`가 내부적으로 `desalt()`로 재정규화하면서
+   문자열이 달라져 `similarity.filter()` 목 구현의 문자열 완전일치 조회가 실패했다 (Trovafloxacin
+   케이스에서 재현). → 레지스트리 등록 시점에 RDKit으로 미리 canonical화하도록 수정.
+
+두 버그 모두 고친 뒤 재실행하니, `run_agent2`가 실제로 여러 개의 유사 화합물을 모아 mmpdb DB를
+만들고, `run_agent3`의 mmpdb transform이 실제 변형 후보를 생성하고, `run_agent4_5`가 PAINS/Brenk +
+(모의) Deep-PK로 정상적으로 게이트/랭킹하는 전체 흐름이 확인됐다.
+
+### `cure_pipeline.py` 자체에서는 버그가 발견되지 않았고, 아래 항목들을 검증 완료
+
+- **안전 대조군 스킵**: Metformin/Amoxicillin/Loratadine/Ibuprofen 전부 모든 독성 축이 낮게
+  나오도록 설정하니 `독성_문제_없음`으로 Agent 2~5를 건너뛰고 즉시 종료 — 의도대로 동작
+- **ChEMBL ID 조회 실패**: 존재하지 않는 약물명 → `타겟_판단불가`로 조기 종료, 예외 없음
+- **타겟 미확정**: 메커니즘 조회가 실패해도 물성·독성 축은 계속 진행 (`효능_판정: 타겟_판단불가`),
+  파이프라인이 죽지 않음
+- **DEEPPK_KEY_MAP 경로**: hERG(Terfenadine, Astemizole, Cisapride), DILI(Trovafloxacin,
+  Troglitazone) 케이스에서 (모의) Deep-PK 게이트가 정상적으로 후보를 통과/차단
+- **비-DEEPPK 경로**: AMES(Bromfenac), 하이픈 포함 항목명 `NR-AR-LBD`(합성 화합물)도 구조
+  경보만으로 정상 게이트 — **mmpdb가 하이픈이 든 property 이름도 문제없이 처리**함을 확인
+- **`top_n_steps=(5, 15, 30)` 확장 로직**: 30개의 합성 후보를 만들어 앞 두 배치(0~4, 5~14)는
+  전부 탈락, 세 번째 배치(15~29)에서만 통과하도록 강제한 별도 단위 테스트로 검증 —
+  `run_agent4_5`가 정확히 `(0,4)`, `(5,14)`, `(15,29)` 세 구간으로, 겹침·누락 없이 순서대로
+  호출됨을 확인 (`확인한_후보수=30`, `랭킹 15`행, 기대값과 일치)
+
+### 한계
+
+- ADMET-AI/Deep-PK 예측값은 SMILES 해시 기반 합성 점수라 **실제 생물학적 타당성은 없음** —
+  로직(분기/게이트/파일처리)만 검증됐고, 실제 ChEMBL 응답 스펙(필드명, 페이지네이션 등)이나
+  실제 Deep-PK 응답의 정확한 키 이름(`DEEPPK_KEY_MAP`)이 맞는지는 실제 네트워크 환경에서
+  최초 1회 확인이 필요함
+- mmpdb의 실제 fragmentation/transform 알고리즘 자체는 검증 대상이 아니라 그대로 사용 —
+  mmpdb 자체 버그 여부는 이 테스트 범위 밖
+
+`mock_harness.py`는 레포에 함께 커밋해뒀다. 네트워크 없이 로직을 더 회귀 테스트하고 싶으면
+`python mock_harness.py`로 바로 재실행 가능하고, `RAW_COMPOUNDS`/`FORCED_PRIMARY` 딕셔너리에
+화합물이나 시나리오를 더 추가하면 된다.
+
+## 7. 다음 단계 제안
 
 1. 네트워크가 열린 환경(Colab, 로컬 등)에서 위 "실행 방법"으로 10개 화합물 배치 실행
 2. 에러가 나면 `_with_retry`/`_run_mmpdb`/`deeppk_predict`가 남기는 로그(화합물명 + 실제 응답/에러
