@@ -174,7 +174,27 @@ ChEMBL/Deep-PK를 실제로 못 부르는 대신, **ChEMBL/ADMET-AI/Deep-PK 호�
 `python mock_harness.py`로 바로 재실행 가능하고, `RAW_COMPOUNDS`/`FORCED_PRIMARY` 딕셔너리에
 화합물이나 시나리오를 더 추가하면 된다.
 
-## 7. 다음 단계 제안
+## 7. ChEMBL API 필드명 사전 검증 (공식 문서/소스 기반)
+
+실제 API를 호출할 수 없어서, 대신 ChEMBL 공식 GitHub 저장소
+(`chembl/chembl_webresource_client`의 `test_docs_examples.py`, `chembl/notebooks`의
+학습용 노트북)에 있는 실제 예제 코드와 검증된 응답 필드를 웹 검색으로 대조했다.
+
+| 코드가 쓰는 필드 | 호출 위치 | 검증 결과 |
+|---|---|---|
+| `molecule_chembl_id` | `molecule.search()` → `get_chembl_id()` | ✅ 공식 예제로 확인 |
+| `molecule_structures.canonical_smiles` | `molecule.get()` → `get_smiles()` | ✅ 공식 예제로 확인 (nested 구조 포함) |
+| `target_chembl_id` | `mechanism.filter(molecule_chembl_id=...)` → `run_agent0_1()` | ✅ 필드 자체는 mechanism 레코드에 존재 확인. ⚠️ 공식 예제는 반대 방향(`target_chembl_id`로 필터링)만 보여줌 — `molecule_chembl_id`로 필터링하는 예제는 못 찾음. 필드가 있으니 동작할 가능성이 높지만 **네트워크 열리면 제일 먼저 결과가 비어있지 않은지 확인 권장** |
+| `standard_value`, `pchembl_value`, `standard_type` | `activity.filter()` → `get_own_activity()`, `get_target_activities()` | ✅ 공식 예제로 확인 |
+| `standard_units` | 같은 activity 필터 | ⚠️ 이번 검색에서 직접 인용된 예제를 못 찾음 (관용적으로 잘 알려진 필드라 신뢰도는 높음) |
+| `molecule_chembl_id`, `similarity` | `similarity.filter(smiles=..., similarity=...)` → `get_similar_compounds()` | ✅ 공식 예제로 정확히 이 두 필드로 확인 |
+| `pref_name` | `target.get()` → `get_target_name()` (현재 파이프라인에서 미사용) | molecule.get() 응답엔 있음 확인. target 리소스도 ChEMBL 관례상 동일 필드를 가짐. 이 함수 자체가 죽은 코드라 우선순위 낮음 |
+
+**결론**: Deep-PK 응답 키(`DEEPPK_KEY_MAP`)와 달리 ChEMBL 필드명은 코드가 이미 정확한 것으로
+보인다. 불확실한 지점 두 개(`mechanism.filter(molecule_chembl_id=...)` 방향, `standard_units`)만
+네트워크가 열리면 첫 실행에서 우선 확인.
+
+## 8. 다음 단계 제안
 
 1. 네트워크가 열린 환경(Colab, 로컬 등)에서 위 "실행 방법"으로 10개 화합물 배치 실행
 2. 에러가 나면 `_with_retry`/`_run_mmpdb`/`deeppk_predict`가 남기는 로그(화합물명 + 실제 응답/에러
