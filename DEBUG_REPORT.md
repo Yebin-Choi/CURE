@@ -224,7 +224,63 @@ Predictions (예: `general_properties_bp`류 속성), Probability, Interpretatio
 에러 메시지에 노출하므로, 네트워크가 열려 hERG/DILI 화합물을 처음 돌릴 때 이 부분이 틀렸다면
 바로 확인되고 고치기 쉽다.
 
-## 9. 다음 단계 제안
+## 9. 진짜 ADMET-AI로 파이프라인 재검증 — 중요한 정정 사항 있음
+
+`admet-ai`를 격리된 venv에 실제로 설치해서 로컬 추론이 되는지 시도해봤다.
+
+### 정정: ADMET-AI는 외부 서버 의존이 아니라 완전 오프라인 동작
+
+배경 설명에서 "ChEMBL·ADMET-AI·Deep-PK는 모두 외부 서버 의존"이라고 했는데, 확인해보니
+**ADMET-AI는 다르다**: `pip install admet-ai` 후 `ADMETModel()`을 생성하면 모델 가중치가
+패키지에 이미 포함돼 있어서 **어떤 네트워크 호출도 없이** 0.4초 만에 초기화되고, 예측도 완전히
+로컬에서 돈다 (실측: 네트워크 완전 차단된 이 세션에서 정상 동작 확인). 아마 실제 겪었던
+ADMET-AI 관련 장애는 API 서버 문제가 아니라 다른 원인(메모리/리소스, 버전 문제 등)이었을
+가능성이 있다. `_with_retry`로 감싸둔 건 여전히 유효하다 — 로컬이라도 잘못된 SMILES 등으로
+예외가 날 수 있으니 — 다만 "재시도하면 나아지는 네트워크 문제"라는 전제는 ADMET-AI에는 해당
+안 된다는 점을 기록해둔다.
+
+### `TOXICITY_ENDPOINTS` 18개 전부 실제 출력과 100% 일치 확인
+
+Aspirin으로 실제 예측을 돌려서 반환된 dict의 키를 코드의 `TOXICITY_ENDPOINTS` 리스트와
+대조했다 — `AMES`, `DILI`, `hERG`, `ClinTox`, `Carcinogens_Lagunin`, `Skin_Reaction`, `NR-AR`,
+`NR-AR-LBD`, `NR-AhR`, `NR-Aromatase`, `NR-ER`, `NR-ER-LBD`, `NR-PPAR-gamma`, `SR-ARE`,
+`SR-ATAD5`, `SR-HSE`, `SR-MMP`, `SR-p53` 전부 정확히 일치. 더 이상 추측이 아니라 실측 확인.
+
+### 배치(리스트) 입력 형태도 실측 확인 — `run_agent2`의 사용법이 맞음
+
+`model.predict(smiles=[...])`는 **SMILES 문자열을 인덱스로 쓰는 pandas DataFrame**을 반환한다
+(정수 인덱스가 아님). `run_agent2`의 `zip(all_compounds, batch_preds[property_name])`은 Series를
+위치 기반으로 순회하므로 입력 리스트 순서와 정확히 맞물려 동작한다 — 실측으로 확인, 코드 수정
+불필요.
+
+### 진짜 ADMET-AI + 진짜 RDKit + 진짜 mmpdb로 5개 화합물 풀 파이프라인 실행 (ChEMBL/Deep-PK만 mock)
+
+Cisapride, Terfenadine, Trovafloxacin, Metformin, Ibuprofen을 실제 예측값으로 `run_batch()`
+끝까지 돌렸다 — **크래시 없음**, 전 구간(진단 → mmpdb 빌드 → transform → PAINS/Brenk 게이트 →
+랭킹) 정상 동작.
+
+| 화합물 | 1차 문제축 (실측) | 결과 |
+|---|---|---|
+| Cisapride | **hERG** | 완료, 5개 후보 통과 |
+| Terfenadine | **hERG** | 완료, 4개 후보 통과 |
+| Trovafloxacin | 없음 (0.7 임계값 미만) | 독성_문제_없음 |
+| Metformin | Skin_Reaction | 완료, 5개 후보 통과 |
+| Ibuprofen | 없음 | 독성_문제_없음 |
+
+**실제 약리학과의 흥미로운 일치**: Cisapride와 Terfenadine은 둘 다 실제로 QT 연장/hERG 관련
+심장독성으로 시장에서 철수된 약물인데, ADMET-AI가 정확히 hERG를 최우선 문제축으로 짚어냈다 —
+파이프라인의 진단 로직이 실제 약리학적으로 말이 되는 결과를 낸다는 신호.
+
+**주의할 점**: Trovafloxacin은 실제로는 DILI(간독성)로 철수됐지만 이번 실측에서 ADMET-AI가
+DILI를 0.7 임계값 이상으로 잡지 못했고, Metformin(안전해야 할 대조군)은 오히려
+Skin_Reaction이 잡혔다. 이건 **파이프라인 코드 버그가 아니라 ADMET-AI 모델 자체의 예측
+정확도 한계**다 — 코드는 모델이 뭘 반환하든 올바르게 처리하고 있다.
+
+**결론**: `cure_pipeline.py`의 Agent 0~5 로직은 이제 실제 화합물 구조·실제 ADMET-AI 예측값·
+실제 RDKit·실제 mmpdb 조합으로 검증됐다. 남은 미검증 영역은 ChEMBL 응답(1차 소스로 필드명은
+확인했지만 실제 라이브 호출은 못 해봄)과 Deep-PK 응답 키뿐이다.
+
+## 10. 다음 단계 제안
 
 1. 네트워크가 열린 환경(Colab, 로컬 등)에서 위 "실행 방법"으로 10개 화합물 배치 실행
 2. 에러가 나면 `_with_retry`/`_run_mmpdb`/`deeppk_predict`가 남기는 로그(화합물명 + 실제 응답/에러
