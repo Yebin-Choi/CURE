@@ -49,6 +49,15 @@ DEEPPK_KEY_MAP = {
     "hERG": "[Toxicity/hERG Blockers] Predictions",
 }
 
+# mmpdb index의 --max-variable-heavies 기본값(10)을 그대로 쓰던 걸 명시적으로 드러냄.
+# 이 값보다 원자 수가 많은 "변형 부위(variable fragment)"를 가진 매칭쌍은 index 단계에서
+# 조용히 제외된다 — 실측 확인: Cisapride 사례에서 10(기본값)일 땐 후보 17개, 제한을 풀면
+# (--max-variable-heavies none) 130개로 7.6배 늘어남. 즉 지금 이 값은 "국소적인 치환"만
+# 후보로 보겠다는 실질적인 설계 선택이다. 더 큰 구조 변경까지 후보로 보고 싶다면 이 값을
+# 올리거나 None으로 설정(제한 없음)할 것 — 다만 후보가 늘어난 만큼 mmpdb 빌드/transform
+# 시간도 늘어난다.
+MMPDB_MAX_VARIABLE_HEAVIES = 10
+
 
 # ── 공용 유틸 ────────────────────────────────────────────────
 RETRY_DELAYS = (2, 4, 8, 16)  # 초 단위 지수 백오프 (총 5회 시도)
@@ -350,7 +359,11 @@ def run_agent2(smiles, chembl_id, property_name):
         ["mmpdb", "fragment", compounds_path, "-o", fragdb_path],
         label=f"fragment({chembl_id})",
     )
-    _run_mmpdb(["mmpdb", "index", fragdb_path, "-o", mmpdb_path], label=f"index({chembl_id})")
+    max_var_heavies = "none" if MMPDB_MAX_VARIABLE_HEAVIES is None else str(MMPDB_MAX_VARIABLE_HEAVIES)
+    _run_mmpdb(
+        ["mmpdb", "index", fragdb_path, "--max-variable-heavies", max_var_heavies, "-o", mmpdb_path],
+        label=f"index({chembl_id})",
+    )
 
     batch_preds = _with_retry(
         lambda: model.predict(smiles=[s for s, _ in all_compounds]),

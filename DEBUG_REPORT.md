@@ -408,7 +408,60 @@ def _parse_activity_values(resolved, context):
 백분위 100.0 — 남은 값들 기준으로 정상 계산됨). 전체 19개 화합물 배치와 기존 오프라인
 단위 테스트 모두 재실행해서 회귀 없음을 재확인했다.
 
-## 13. 다음 단계 제안
+## 13. `mmpdb transform` 옵션 심층 조사 — 중요한 숨은 기본값 발견
+
+요청받아서 `mmpdb fragment`/`index`/`transform` 세 서브커맨드의 `--help` 전문을 읽고,
+`cure_pipeline.py`가 옵션을 전혀 안 주고 전부 기본값에 의존하고 있는 지점들을 점검했다.
+
+### 발견: `mmpdb index --max-variable-heavies` 기본값(10)이 후보를 7.6배 줄이고 있음
+
+`mmpdb index`의 기본값 중 `--max-variable-heavies N (default: 10)`이 있다 — **"변형 부위
+(variable fragment)"의 중원자 수가 10개를 넘는 매칭쌍은 index 단계에서 조용히 제외**된다.
+`cure_pipeline.py`는 이 옵션을 전혀 지정하지 않아 암묵적으로 10이 적용되고 있었다.
+
+Cisapride의 실제 mmp.db(진짜 ADMET-AI로 빌드)로 직접 비교해봤다:
+
+| 설정 | Agent 3 최종 후보 수 |
+|---|---|
+| `--max-variable-heavies 10` (기존 암묵적 기본값) | **17개** |
+| `--max-variable-heavies none` (제한 없음) | **130개** (7.6배) |
+
+즉 지금 파이프라인은 "국소적인(원자 10개 이내) 치환"만 후보로 보고, 그보다 큰 구조 변경은
+Agent 3가 애초에 제안 자체를 못 하게 돼 있다 — 에러도 경고도 없이 조용히. 독성 원인이 되는
+부위가 10개 원자보다 큰 치환기라면, 지금 설정으로는 그걸 고치는 후보를 원천적으로 볼 수 없다.
+
+### 어떻게 처리했나 — 값은 안 바꾸고, 보이게만 만듦
+
+이건 코드 버그가 아니라 **과학적 판단이 필요한 파라미터**라서, 제가 임의로 "더 큰 값이 낫다"고
+판단해서 바꾸지 않았다. 대신:
+
+```python
+# mmpdb index의 --max-variable-heavies 기본값(10)을 명시적으로 드러냄.
+# 실측: Cisapride 사례에서 10(기본값)일 땐 후보 17개, 제한을 풀면 130개(7.6배).
+MMPDB_MAX_VARIABLE_HEAVIES = 10
+```
+
+를 파일 상단(다른 설정 상수들, `TOXICITY_ENDPOINTS`/`DEEPPK_KEY_MAP` 옆)에 추가하고,
+`run_agent2()`의 `mmpdb index` 호출에 `--max-variable-heavies {값}`을 명시적으로 전달하도록
+바꿨다. **기본값 자체는 10 그대로**라 지금 당장 결과는 전혀 안 바뀐다(재검증: Cisapride
+후보 수 17개로 동일) — 단지 "10이라는 값이 실제로 후보를 7.6배 줄이고 있다"는 사실과 그
+숫자가 코드 안에 눈에 보이게 남아서, 나중에 필요하면 (`None`으로 바꾸거나 다른 값을 주는 식으로)
+조정하기 쉬워졌다.
+
+### 그 외 확인한 기본값 (특별히 손대지 않음, 참고용)
+
+- `mmpdb fragment --num-cuts` 기본값 3 — 최대 3-cut 조합까지 fragmentation을 시도. 이게
+  `--max-variable-heavies`가 걸러내는 큰 후보들이 애초에 왜 생성되는지의 원인이기도 하다
+  (더 많이 자를수록 큰 variable fragment 조합도 나옴). 건드리지 않음.
+- `mmpdb fragment --cut-smarts`의 기본(`'default'`) 규칙은 **아미드/에스터/아미딘/설폰아미드
+  결합은 자르지 않는다** — 신약 구조에 아미드가 흔하다는 걸 감안하면, 문제 부위가 아미드
+  근처에 있는 경우 그 부위를 직접 건드리는 변형은 기본 설정상 아예 후보로 안 나올 수 있다.
+  건드리지 않음 (이것도 화학적 판단 영역).
+- `mmpdb fragment --salt-remover` 기본값이 RDKit 표준 salt remover를 또 적용함 — 이미
+  `desalt()`에서 한 번 처리한 뒤라 중복이지만, 이미 desalt된 SMILES엔 제거할 salt가 없으니
+  실질적 영향 없음 (no-op 수준의 중복). 손대지 않음.
+
+## 14. 다음 단계 제안
 
 1. 네트워크가 열린 환경(Colab, 로컬 등)에서 위 "실행 방법"으로 10개 화합물 배치 실행
 2. 에러가 나면 `_with_retry`/`_run_mmpdb`/`deeppk_predict`가 남기는 로그(화합물명 + 실제 응답/에러
