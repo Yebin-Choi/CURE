@@ -311,7 +311,65 @@ Skin_Reaction이 잡혔다. 이건 **파이프라인 코드 버그가 아니라 
 mmpdb 자체의 정상적인 거부이고, 파이프라인의 에러 핸들링이 의도대로 이를 흡수했다.
 `mock_harness.py`는 계속 화합물/시나리오를 추가해서 회귀 테스트로 쓸 수 있다.
 
-## 11. 다음 단계 제안
+## 11. 진짜 `cure_pipeline.py` 버그 발견 및 수정 — 파싱 불가 SMILES 처리
+
+`desalt()`에 일부러 RDKit이 못 읽는 문자열(`"THIS_IS_NOT_VALID_SMILES_@#$%"`)을 넣어봤더니
+`AttributeError: 'NoneType' object has no attribute 'GetNumAtoms'`라는, 어디서 뭐가 잘못됐는지
+전혀 알 수 없는 에러로 죽었다. 이번 세션에서 처음 발견한 진짜 `cure_pipeline.py` 자체 버그다
+(이전까지 발견한 버그는 전부 `mock_harness.py`쪽이었음).
+
+### 문제
+
+`desalt()`와 `strip_isotopes()` 둘 다 `Chem.MolFromSmiles(smiles)`가 파싱 실패 시 `None`을
+반환할 수 있는데, `None` 체크 없이 바로 `.GetAtoms()`/`remover.StripMol()`을 호출해서 크래시.
+이 두 함수는 **ChEMBL이 반환한 원본 SMILES 문자열**을 직접 받는 지점(`get_smiles()`,
+`get_similar_smiles()`, `dedup_against_query()`)이라 — 배경 설명에서 지적한 "ChEMBL 응답이
+가끔 이상하게 온다"는 리스크가 그대로 걸리는 위치다.
+
+### 수정 1: `desalt()` / `strip_isotopes()`가 명확한 에러를 내도록
+
+```python
+def desalt(smiles):
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"RDKit이 파싱할 수 없는 SMILES (ChEMBL 응답 확인 필요): {smiles!r}")
+    return Chem.MolToSmiles(remover.StripMol(mol))
+```
+
+(`strip_isotopes()`도 동일 패턴으로 수정)
+
+이제 크래시 대신 `ValueError`로 어떤 SMILES가 문제였는지 그대로 노출한다. `get_smiles()`는
+`_with_retry`로 감싸져 있어서 최종적으로는 `[SMILES 조회: {chembl_id}] ... ValueError: ...`
+형태로 화합물 ID까지 포함된 로그가 남는다.
+
+### 수정 2: 유사 화합물 하나의 SMILES가 깨져도 그 화합물 전체가 죽지 않게
+
+처음엔 수정 1만으로 끝내려 했는데, 생각해보니 `get_similar_smiles()`는 ChEMBL 유사도 검색으로
+찾은 **여러** 화합물의 SMILES를 순회하며 조회한다 — 그중 단 하나만 파싱 불가여도 루프 전체가
+죽어서, 나머지 정상적인 유사 화합물들까지 다 못 쓰고 해당 화합물의 파이프라인이 전부
+`에러`로 끝나버리는 건 과하다고 판단했다. `run_batch()`가 화합물 단위로 격리해주는 것과 같은
+원칙을 한 단계 더 안쪽(analog 단위)에도 적용:
+
+```python
+try:
+    result.append((desalt(raw), cid))
+except ValueError as e:
+    print(f"  [건너뜀] 유사 화합물 {cid}: {e}")
+```
+
+`_with_retry`가 이미 소진해서 던지는 `RuntimeError`(네트워크 문제)는 그대로 전파시키고,
+`desalt()`가 던지는 `ValueError`(데이터 품질 문제)만 건너뛴다 — 두 실패 유형을 구분해서
+처리한 것.
+
+### 검증
+
+`mock_harness.py`에 `BadAnalogSmilesDrug`를 추가해서 analog 풀에 파싱 불가 SMILES를 하나
+섞어넣고 가짜 모델·진짜 ADMET-AI 양쪽 다 재실행 — 두 경우 다 문제 analog 하나만
+`[건너뜀]` 로그를 남기고 스킵된 뒤, 나머지 정상 analog들로 화합물 전체가 정상적으로
+`완료` 상태까지 도달함을 확인했다. 기존 오프라인 단위 테스트(`test_pipeline.py`)도 전부
+재실행해서 이 변경으로 회귀가 없음을 확인했다.
+
+## 12. 다음 단계 제안
 
 1. 네트워크가 열린 환경(Colab, 로컬 등)에서 위 "실행 방법"으로 10개 화합물 배치 실행
 2. 에러가 나면 `_with_retry`/`_run_mmpdb`/`deeppk_predict`가 남기는 로그(화합물명 + 실제 응답/에러

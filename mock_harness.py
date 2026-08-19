@@ -37,6 +37,7 @@ FORCED_PRIMARY = {
     "DuplicateSmilesDrug": ("DILI", 0.8),
     "SparseDataDrug": ("AMES", 0.8),
     "TinyMolecule": ("hERG", 0.8),
+    "BadAnalogSmilesDrug": ("DILI", 0.8),
 }
 SAFE_CONTROLS = {"Metformin", "Amoxicillin", "Loratadine", "Ibuprofen"}
 
@@ -252,6 +253,7 @@ RAW_COMPOUNDS = {
     "DuplicateSmilesDrug": "COc1ccc(Cl)cc1C(=O)Nc1ccc(F)cc1N",  # analog 중 SMILES 중복 강제
     "SparseDataDrug": "Clc1ccc(NC(=O)c2ccccn2)cc1",  # 활성 데이터 4개만 -> 데이터_부족 경로
     "TinyMolecule": "C",  # 메탄 — 최소 구조에서 SAScore/PAINS/mmpdb가 안 죽는지
+    "BadAnalogSmilesDrug": "COc1ccc(C(=O)Nc2ccccc2)cc1Cl",  # 유사 화합물 중 하나가 파싱 불가 SMILES
     # 엣지 케이스
     "존재하지않는약": None,           # ChEMBL ID 조회 실패 -> None
     "TargetlessDrug": "CCO",           # 타겟 미확정 케이스용 (에탄올로 단순화)
@@ -262,6 +264,7 @@ EDGE_NO_TARGET = {"TargetlessDrug"}
 EDGE_DUP_SMILES = {"DuplicateSmilesDrug"}
 EDGE_SPARSE_POP = {"SparseDataDrug"}
 EDGE_ISOTOPE_SELF = {"ChiralDrug"}  # 쿼리 자신의 동위원소 표지 버전을 analog 풀에 섞어넣음
+EDGE_BAD_ANALOG_SMILES = {"BadAnalogSmilesDrug"}  # analog 하나에 RDKit이 못 읽는 SMILES 주입
 
 
 def _canon(smiles):
@@ -307,6 +310,8 @@ for i, (name, smi) in enumerate(RAW_COMPOUNDS.items()):
         analog_pairs.append((f"{cid}_DUP", dup_smiles))
     if name in EDGE_ISOTOPE_SELF:
         analog_pairs.append((f"{cid}_ISO", _isotope_labeled_self(smi)))
+    if name in EDGE_BAD_ANALOG_SMILES:
+        analog_pairs.append((f"{cid}_BAD", "NOT_A_VALID_SMILES_###"))
     entry["analogs"] = analog_pairs
     REGISTRY[name] = entry
 

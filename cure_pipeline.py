@@ -88,12 +88,16 @@ def _run_mmpdb(args, label):
 def desalt(smiles):
     # 대이온(counter-ion) 제거
     mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"RDKit이 파싱할 수 없는 SMILES (ChEMBL 응답 확인 필요): {smiles!r}")
     return Chem.MolToSmiles(remover.StripMol(mol))
 
 
 def strip_isotopes(smiles):
     # 동위원소 표지 제거 (구조 정규화용)
     mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"RDKit이 파싱할 수 없는 SMILES (ChEMBL 응답 확인 필요): {smiles!r}")
     for atom in mol.GetAtoms():
         atom.SetIsotope(0)
     return Chem.MolToSmiles(mol)
@@ -287,6 +291,8 @@ def get_similar_compounds(smiles, threshold=70):
 
 
 def get_similar_smiles(similar_compounds):
+    # 유사 화합물 중 일부가 RDKit이 못 읽는 SMILES를 갖고 있어도(ChEMBL 데이터 품질 이슈)
+    # 그 하나 때문에 화합물 전체가 죽지 않도록 건너뛰고 계속 진행한다.
     result = []
     for c in similar_compounds:
         cid = c["molecule_chembl_id"]
@@ -294,7 +300,10 @@ def get_similar_smiles(similar_compounds):
             lambda cid=cid: molecule.get(cid)["molecule_structures"]["canonical_smiles"],
             label=f"유사 화합물 SMILES 조회: {cid}",
         )
-        result.append((desalt(raw), cid))
+        try:
+            result.append((desalt(raw), cid))
+        except ValueError as e:
+            print(f"  [건너뜀] 유사 화합물 {cid}: {e}")
     return result
 
 
