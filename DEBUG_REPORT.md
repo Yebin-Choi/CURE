@@ -280,7 +280,38 @@ Skin_Reaction이 잡혔다. 이건 **파이프라인 코드 버그가 아니라 
 실제 RDKit·실제 mmpdb 조합으로 검증됐다. 남은 미검증 영역은 ChEMBL 응답(1차 소스로 필드명은
 확인했지만 실제 라이브 호출은 못 해봄)과 Deep-PK 응답 키뿐이다.
 
-## 10. 다음 단계 제안
+## 10. `mock_harness.py`를 real ADMET-AI 자동 감지 + 새 경계 케이스로 확장
+
+`mock_harness.py`를 고쳐서 `admet_ai`가 설치돼 있으면 **자동으로 진짜 패키지를 쓰고**
+(설치 안 돼 있으면 이전처럼 시나리오 강제 가능한 가짜 모델로 자동 폴백), 화합물 목록에
+"에러가 날 것 같은" 경계 케이스 5개를 추가로 넣어 17개 화합물로 확장했다. 이 상태로 (1)
+가짜 모델, (2) 진짜 ADMET-AI(venv) 두 번 다 돌려봤다.
+
+### 새로 추가한 경계 케이스와 결과
+
+| 화합물 | 테스트 의도 | 결과 |
+|---|---|---|
+| `ChiralDrug` | 카이랄 중심(`[C@@H]`)이 desalt/strip_isotopes/mmpdb 파이프라인을 깨는지 | ✅ 문제없음, 정상 완료 |
+| `DuplicateSmilesDrug` | 서로 다른 ChEMBL ID인데 SMILES가 완전히 같은 "유사 화합물" 2개를 analog 풀에 강제로 넣음 (실제 ChEMBL에서 염/입체 변형이 별도 등록돼 흔히 발생) | ✅ **`dedup_against_query`가 이미 방어하고 있음을 실측 확인** — pairs 9개 → dedup 후 8개, 중복 SMILES 중 하나가 정확히 제거됨. `run_agent2`가 pandas DataFrame(SMILES 인덱스, 중복 라벨 가능)을 다루는 것에 대한 우려가 있었는데, 애초에 dedup 단계에서 중복이 mmpdb 파일 쓰기까지 도달하지 않아 리스크 자체가 없음을 확인 |
+| `SparseDataDrug` | 활성 데이터가 4개뿐일 때 (`potency_percentile`의 5개 미만 조건) | ✅ `효능_판정: 데이터_부족` 정확히 트리거됨 (직접 호출로 재확인) |
+| `TinyMolecule` (메탄, `"C"`) | 극단적으로 작은 분자에서 SAScore/PAINS/mmpdb가 안 죽는지 | ⚠️ **mmpdb 자체가 거부함** — `mmpdb transform`이 `Unable to fragment --smiles 'C': not enough heavy atoms`로 exit 1. 가짜 모델·진짜 ADMET-AI 두 번 다 동일하게 재현. 이건 `cure_pipeline.py`의 버그가 아니라 **mmpdb의 전제조건**(쪼갤 결합이 있어야 fragment 가능)이고, 실제 실패/철수 항암제가 단일 원자일 리는 없어 현실적으로 발생하지 않는 케이스다. 중요한 건 이미 추가해둔 에러 핸들링(`_run_mmpdb`, `run_full_pipeline`의 단계별 try/except)이 **정확히 의도대로 동작**했다는 것: 배치 전체가 죽지 않고, 어느 화합물·어느 단계·mmpdb의 실제 stderr까지 로그로 남기고, 다음 화합물로 계속 진행됨. 코드 수정 안 함 — 현실에 없는 시나리오라 방어 코드를 더 추가하지 않는다 |
+| `ChiralDrug`의 analog 풀에 쿼리 자신의 **동위원소 표지 버전**(`[13CH3]`)을 섞어넣음 | 배경 설명에서 경고한 "ChEMBL 유사도 검색에 쿼리 자신의 동위원소 표지 버전이 섞여 나옴" 패턴 재현 | ✅ `dedup_against_query`의 `strip_isotopes()` 비교가 정확히 걸러냄 — pairs 3개 → dedup 후 2개, 동위원소 표지 자기복제가 결과에서 사라짐을 직접 확인 |
+
+### 처음으로 실측된 것: `top_n_steps` 5→15→30 전체 확장
+
+진짜 ADMET-AI로 돌린 라운드에서 **Loratadine이 5, 15, 30 세 배치를 전부 거쳐도 통과 후보가
+없어서 `통과_후보_없음`으로 정상 종료**됐다 (`확인한_후보수=30`). 이전엔 이 경로를 격리된
+합성 단위 테스트로만 검증했었는데, 이번에 실제 mmpdb 산출물 + 실제 게이트 로직으로 자연 발생한
+사례를 처음 봤다 — 정상 동작 확인, 크래시 없음.
+
+### 종합: 이번 라운드에서 `cure_pipeline.py` 자체의 새 버그는 못 찾음
+
+17개 화합물(원래 12개 + 카이랄/중복SMILES/희소데이터/극소분자/동위원소자기복제 5개) 중
+`cure_pipeline.py`가 실제로 잘못 동작한 사례는 없었다. 발견한 유일한 실패(TinyMolecule)는
+mmpdb 자체의 정상적인 거부이고, 파이프라인의 에러 핸들링이 의도대로 이를 흡수했다.
+`mock_harness.py`는 계속 화합물/시나리오를 추가해서 회귀 테스트로 쓸 수 있다.
+
+## 11. 다음 단계 제안
 
 1. 네트워크가 열린 환경(Colab, 로컬 등)에서 위 "실행 방법"으로 10개 화합물 배치 실행
 2. 에러가 나면 `_with_retry`/`_run_mmpdb`/`deeppk_predict`가 남기는 로그(화합물명 + 실제 응답/에러

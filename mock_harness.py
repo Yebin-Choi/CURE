@@ -1,11 +1,14 @@
 """
 오프라인 모의 실험 하네스.
 
-ChEMBL/ADMET-AI/Deep-PK 호출부만 실제와 비슷한 합성 데이터로 대체하고,
-RDKit(구조 처리)·mmpdb(실제 CLI 서브프로세스)·pandas 로직은 cure_pipeline.py의
-진짜 코드를 그대로 실행한다. 목적은 네트워크 없이도 여러 화합물을 넣어봤을 때
-파이프라인 로직 자체(파일 처리, mmpdb 연동, 게이트/랭킹 로직, 예외 처리)에
-버그가 있는지 찾아내는 것.
+ChEMBL/Deep-PK 호출부는 실제와 비슷한 합성 데이터로 대체한다 (두 서버 다 이 환경에서
+egress 정책상 접속 불가). ADMET-AI는 설치돼 있으면 **진짜 패키지를 그대로 사용**하고
+(완전 오프라인 동작 확인됨 — 모델 가중치 내장, 네트워크 불필요), 없으면 이전처럼
+시나리오를 강제할 수 있는 가짜 모델로 자동 폴백한다. RDKit(구조 처리)·mmpdb(실제 CLI
+서브프로세스)·pandas 로직은 cure_pipeline.py의 진짜 코드를 그대로 실행한다.
+
+목적은 네트워크 없이도 여러 화합물을 넣어봤을 때 파이프라인 로직 자체(파일 처리,
+mmpdb 연동, 게이트/랭킹 로직, 예외 처리, 경계 케이스)에 버그가 있는지 계속 찾아내는 것.
 """
 import hashlib
 import os
@@ -15,26 +18,13 @@ import types
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# ── admet_ai / chembl_webresource_client를 실제 모듈처럼 흉내내는 모의 계층 ──
-admet_ai_mod = types.ModuleType("admet_ai")
-
-
 TOX_ENDPOINTS = [
     "AMES", "DILI", "hERG", "ClinTox", "Carcinogens_Lagunin", "Skin_Reaction",
     "NR-AR", "NR-AR-LBD", "NR-AhR", "NR-Aromatase", "NR-ER", "NR-ER-LBD", "NR-PPAR-gamma",
     "SR-ARE", "SR-ATAD5", "SR-HSE", "SR-MMP", "SR-p53",
 ]
 
-
-def _seeded_score(smiles, endpoint, base=None):
-    h = hashlib.md5(f"{smiles}|{endpoint}".encode()).hexdigest()
-    v = int(h[:8], 16) / 0xFFFFFFFF
-    if base is not None:
-        v = min(1.0, max(0.0, base + (v - 0.5) * 0.15))
-    return round(v, 3)
-
-
-# 시나리오별로 특정 화합물엔 특정 축이 "고위험"이 되도록 base를 강제한다
+# 시나리오별로 특정 화합물엔 특정 축이 "고위험"이 되도록 base를 강제한다 (가짜 모델일 때만 적용)
 FORCED_PRIMARY = {
     "Terfenadine": ("hERG", 0.9),
     "Astemizole": ("hERG", 0.88),
@@ -43,38 +33,57 @@ FORCED_PRIMARY = {
     "Troglitazone": ("DILI", 0.81),
     "Bromfenac": ("AMES", 0.78),  # DEEPPK_KEY_MAP에 없는 축 경로 테스트
     "HyphenTestDrug": ("NR-AR-LBD", 0.75),  # 하이픈 포함 property명이 mmpdb를 통과하는지 테스트
+    "ChiralDrug": ("hERG", 0.8),
+    "DuplicateSmilesDrug": ("DILI", 0.8),
+    "SparseDataDrug": ("AMES", 0.8),
+    "TinyMolecule": ("hERG", 0.8),
 }
 SAFE_CONTROLS = {"Metformin", "Amoxicillin", "Loratadine", "Ibuprofen"}
 
+try:
+    import admet_ai as _real_admet_ai  # noqa: F401
+    USE_REAL_ADMET = True
+except ImportError:
+    USE_REAL_ADMET = False
 
-class FakeADMETModel:
-    def __init__(self, *a, **k):
-        pass
+if not USE_REAL_ADMET:
+    # ── admet_ai를 실제 모듈처럼 흉내내는 모의 계층 (설치 안 돼 있을 때만) ──
+    admet_ai_mod = types.ModuleType("admet_ai")
 
-    def predict(self, smiles):
-        if isinstance(smiles, str):
-            return self._predict_one(smiles, drug_hint=getattr(self, "_current_drug", None))
-        # 배치: {endpoint: [값들]} 형태, 입력 순서와 정렬 일치해야 함
-        rows = [self._predict_one(s) for s in smiles]
-        return {ep: [r[ep] for r in rows] for ep in TOX_ENDPOINTS}
+    def _seeded_score(smiles, endpoint, base=None):
+        h = hashlib.md5(f"{smiles}|{endpoint}".encode()).hexdigest()
+        v = int(h[:8], 16) / 0xFFFFFFFF
+        if base is not None:
+            v = min(1.0, max(0.0, base + (v - 0.5) * 0.15))
+        return round(v, 3)
 
-    def _predict_one(self, smiles, drug_hint=None):
-        forced_ep, forced_base = (None, None)
-        if drug_hint and drug_hint in FORCED_PRIMARY:
-            forced_ep, forced_base = FORCED_PRIMARY[drug_hint]
-        row = {}
-        for ep in TOX_ENDPOINTS:
-            if drug_hint in SAFE_CONTROLS:
-                row[ep] = _seeded_score(smiles, ep, base=0.15)
-            elif ep == forced_ep:
-                row[ep] = forced_base
-            else:
-                row[ep] = _seeded_score(smiles, ep, base=0.3)
-        return row
+    class FakeADMETModel:
+        def __init__(self, *a, **k):
+            pass
 
+        def predict(self, smiles):
+            if isinstance(smiles, str):
+                return self._predict_one(smiles, drug_hint=getattr(self, "_current_drug", None))
+            # 배치: {endpoint: [값들]} 형태, 입력 순서와 정렬 일치해야 함
+            rows = [self._predict_one(s) for s in smiles]
+            return {ep: [r[ep] for r in rows] for ep in TOX_ENDPOINTS}
 
-admet_ai_mod.ADMETModel = FakeADMETModel
-sys.modules["admet_ai"] = admet_ai_mod
+        def _predict_one(self, smiles, drug_hint=None):
+            forced_ep, forced_base = (None, None)
+            if drug_hint and drug_hint in FORCED_PRIMARY:
+                forced_ep, forced_base = FORCED_PRIMARY[drug_hint]
+            row = {}
+            for ep in TOX_ENDPOINTS:
+                if drug_hint in SAFE_CONTROLS:
+                    row[ep] = _seeded_score(smiles, ep, base=0.15)
+                elif ep == forced_ep:
+                    row[ep] = forced_base
+                else:
+                    row[ep] = _seeded_score(smiles, ep, base=0.3)
+            return row
+
+    admet_ai_mod.ADMETModel = FakeADMETModel
+    sys.modules["admet_ai"] = admet_ai_mod
 
 chembl_pkg = types.ModuleType("chembl_webresource_client")
 chembl_new_client_mod = types.ModuleType("chembl_webresource_client.new_client")
@@ -239,6 +248,10 @@ RAW_COMPOUNDS = {
     "Loratadine": "CCOC(=O)N1CCC(=C2c3ccc(Cl)cc3CCc3cccnc32)CC1",
     "Ibuprofen": "CC(C)Cc1ccc(C(C)C(=O)O)cc1",
     "HyphenTestDrug": "COc1ccc(C(=O)Nc2ccc(Cl)cc2)cc1N",
+    "ChiralDrug": "CC(C)C[C@@H](C)C(=O)O",  # 카이랄 이부프로펜 — 입체 표기가 canonicalize/mmpdb를 깨는지
+    "DuplicateSmilesDrug": "COc1ccc(Cl)cc1C(=O)Nc1ccc(F)cc1N",  # analog 중 SMILES 중복 강제
+    "SparseDataDrug": "Clc1ccc(NC(=O)c2ccccn2)cc1",  # 활성 데이터 4개만 -> 데이터_부족 경로
+    "TinyMolecule": "C",  # 메탄 — 최소 구조에서 SAScore/PAINS/mmpdb가 안 죽는지
     # 엣지 케이스
     "존재하지않는약": None,           # ChEMBL ID 조회 실패 -> None
     "TargetlessDrug": "CCO",           # 타겟 미확정 케이스용 (에탄올로 단순화)
@@ -246,11 +259,25 @@ RAW_COMPOUNDS = {
 
 EDGE_NO_CHEMBL = {"존재하지않는약"}
 EDGE_NO_TARGET = {"TargetlessDrug"}
+EDGE_DUP_SMILES = {"DuplicateSmilesDrug"}
+EDGE_SPARSE_POP = {"SparseDataDrug"}
+EDGE_ISOTOPE_SELF = {"ChiralDrug"}  # 쿼리 자신의 동위원소 표지 버전을 analog 풀에 섞어넣음
+
 
 def _canon(smiles):
     from rdkit import Chem
 
     return Chem.MolToSmiles(Chem.MolFromSmiles(smiles))
+
+
+def _isotope_labeled_self(smiles):
+    # ChEMBL 유사도 검색이 쿼리 자신의 동위원소 표지 버전을 섞어 반환하는 실제 패턴 재현
+    from rdkit import Chem
+
+    mol = Chem.MolFromSmiles(smiles)
+    atom = mol.GetAtomWithIdx(0)
+    atom.SetIsotope(13)
+    return Chem.MolToSmiles(mol)
 
 
 for i, (name, smi) in enumerate(RAW_COMPOUNDS.items()):
@@ -260,17 +287,27 @@ for i, (name, smi) in enumerate(RAW_COMPOUNDS.items()):
     smi = _canon(smi)  # get_smiles()가 desalt()로 재정규화하므로 등록 시점에 맞춰둔다
     cid = f"CHEMBLFAKE{i:03d}"
     tid = f"TGTFAKE{i:03d}"
+    population = [10, 20, 30, 40, 60, 80, 120, 200, 300][: 5 + (i % 4)]
+    if name in EDGE_SPARSE_POP:
+        population = [15, 25, 35, 45]  # 5개 미만 -> potency_percentile이 None을 반환해야 함
     entry = {
         "chembl_id": cid,
         "target_id": tid,
         "smiles": smi,
         "own_ic50": 40.0 + i * 5,
-        "population_ic50": [10, 20, 30, 40, 60, 80, 120, 200, 300][: 5 + (i % 4)],
+        "population_ic50": population,
     }
     if name in EDGE_NO_TARGET:
         entry["no_target"] = True
     analogs = make_analogs(smi, n=12)
-    entry["analogs"] = [(f"{cid}_A{j}", a) for j, a in enumerate(analogs)]
+    analog_pairs = [(f"{cid}_A{j}", a) for j, a in enumerate(analogs)]
+    if name in EDGE_DUP_SMILES and analog_pairs:
+        # 서로 다른 chembl_id인데 SMILES가 완전히 같은 analog를 하나 더 추가
+        dup_smiles = analog_pairs[0][1]
+        analog_pairs.append((f"{cid}_DUP", dup_smiles))
+    if name in EDGE_ISOTOPE_SELF:
+        analog_pairs.append((f"{cid}_ISO", _isotope_labeled_self(smi)))
+    entry["analogs"] = analog_pairs
     REGISTRY[name] = entry
 
 # FakeADMETModel이 "지금 어느 화합물을 보고 있는지" 알 수 있도록 run_agent0_1 호출 전에 힌트 주입
