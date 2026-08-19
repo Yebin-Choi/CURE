@@ -38,6 +38,7 @@ FORCED_PRIMARY = {
     "SparseDataDrug": ("AMES", 0.8),
     "TinyMolecule": ("hERG", 0.8),
     "BadAnalogSmilesDrug": ("DILI", 0.8),
+    "BadActivityDrug": ("hERG", 0.8),
 }
 SAFE_CONTROLS = {"Metformin", "Amoxicillin", "Loratadine", "Ibuprofen"}
 
@@ -254,6 +255,7 @@ RAW_COMPOUNDS = {
     "SparseDataDrug": "Clc1ccc(NC(=O)c2ccccn2)cc1",  # 활성 데이터 4개만 -> 데이터_부족 경로
     "TinyMolecule": "C",  # 메탄 — 최소 구조에서 SAScore/PAINS/mmpdb가 안 죽는지
     "BadAnalogSmilesDrug": "COc1ccc(C(=O)Nc2ccccc2)cc1Cl",  # 유사 화합물 중 하나가 파싱 불가 SMILES
+    "BadActivityDrug": "Clc1ccc(Cc2ccc(C(=O)O)cc2)cc1",  # 활성값 목록에 비수치 문자열 하나 섞임
     # 엣지 케이스
     "존재하지않는약": None,           # ChEMBL ID 조회 실패 -> None
     "TargetlessDrug": "CCO",           # 타겟 미확정 케이스용 (에탄올로 단순화)
@@ -265,6 +267,7 @@ EDGE_DUP_SMILES = {"DuplicateSmilesDrug"}
 EDGE_SPARSE_POP = {"SparseDataDrug"}
 EDGE_ISOTOPE_SELF = {"ChiralDrug"}  # 쿼리 자신의 동위원소 표지 버전을 analog 풀에 섞어넣음
 EDGE_BAD_ANALOG_SMILES = {"BadAnalogSmilesDrug"}  # analog 하나에 RDKit이 못 읽는 SMILES 주입
+EDGE_BAD_ACTIVITY = {"BadActivityDrug"}  # population_ic50에 비수치 문자열 하나 주입
 
 
 def _canon(smiles):
@@ -293,6 +296,8 @@ for i, (name, smi) in enumerate(RAW_COMPOUNDS.items()):
     population = [10, 20, 30, 40, 60, 80, 120, 200, 300][: 5 + (i % 4)]
     if name in EDGE_SPARSE_POP:
         population = [15, 25, 35, 45]  # 5개 미만 -> potency_percentile이 None을 반환해야 함
+    if name in EDGE_BAD_ACTIVITY:
+        population = [10, 20, "Not Determined", 40, 60, 80]  # 비수치 값 하나 섞임
     entry = {
         "chembl_id": cid,
         "target_id": tid,

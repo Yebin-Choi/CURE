@@ -200,6 +200,19 @@ def diagnose_properties(smiles):
     return props
 
 
+def _parse_activity_values(resolved, context):
+    # standard_value가 하나만 비정상(비수치 문자열 등)이어도 전체가 죽지 않도록 그 레코드만 건너뛴다.
+    values = []
+    for h in resolved:
+        if h["standard_value"] is None:
+            continue
+        try:
+            values.append(float(h["standard_value"]))
+        except (TypeError, ValueError):
+            print(f"  [건너뜀] 활성값 파싱 실패({context}): standard_value={h['standard_value']!r}")
+    return values
+
+
 def get_own_activity(molecule_chembl_id, target_chembl_id):
     hits = activity.filter(
         molecule_chembl_id=molecule_chembl_id,
@@ -211,7 +224,7 @@ def get_own_activity(molecule_chembl_id, target_chembl_id):
     resolved = _with_retry(
         lambda: list(hits), label=f"자체 활성값 조회: {molecule_chembl_id}/{target_chembl_id}"
     )
-    values = [float(h["standard_value"]) for h in resolved if h["standard_value"] is not None]
+    values = _parse_activity_values(resolved, f"{molecule_chembl_id}/{target_chembl_id}")
     return min(values) if values else None
 
 
@@ -223,7 +236,7 @@ def get_target_activities(target_chembl_id, limit=2000):
         pchembl_value__isnull=False,
     ).only(["standard_value"])[:limit]
     resolved = _with_retry(lambda: list(hits), label=f"타겟 활성값 분포 조회: {target_chembl_id}")
-    return [float(h["standard_value"]) for h in resolved if h["standard_value"] is not None]
+    return _parse_activity_values(resolved, target_chembl_id)
 
 
 def potency_percentile(own_value, population_values):

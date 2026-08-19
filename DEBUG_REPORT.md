@@ -369,7 +369,46 @@ except ValueError as e:
 `완료` 상태까지 도달함을 확인했다. 기존 오프라인 단위 테스트(`test_pipeline.py`)도 전부
 재실행해서 이 변경으로 회귀가 없음을 확인했다.
 
-## 12. 다음 단계 제안
+## 12. 같은 패턴의 버그를 하나 더 발견 — activity `standard_value` 파싱
+
+11번에서 SMILES 파싱 실패 크래시를 고친 뒤, 같은 클래스의 문제가 다른 곳에도 있을지
+의심하고 activity 데이터 쪽도 확인해봤다. `get_own_activity()`/`get_target_activities()`가
+`float(h["standard_value"])`를 무조건 호출하고 있어서, 활성값 목록에 숫자로 변환 안 되는
+값(예: `"Not Determined"`)이 하나만 섞여 있어도 `ValueError: could not convert string to
+float`로 전체가 죽는 걸 확인했다.
+
+**실제로 얼마나 위험한가**: 쿼리 자체가 이미 `pchembl_value__isnull=False`로 필터링돼 있어서
+(pchembl_value는 ChEMBL이 standard_value로부터 계산하는 파생값이라, 이게 non-null이면
+standard_value도 보통 깨끗한 숫자다) SMILES 케이스보다는 실제 발생 확률이 낮다. 그래도 같은
+방어 원칙을 적용하는 게 일관적이라고 판단해 고쳤다.
+
+### 수정
+
+`_parse_activity_values()` 헬퍼를 추가해 두 함수가 공유하도록 하고, 개별 레코드 파싱 실패는
+건너뛰고 로그만 남기도록 변경:
+
+```python
+def _parse_activity_values(resolved, context):
+    values = []
+    for h in resolved:
+        if h["standard_value"] is None:
+            continue
+        try:
+            values.append(float(h["standard_value"]))
+        except (TypeError, ValueError):
+            print(f"  [건너뜀] 활성값 파싱 실패({context}): standard_value={h['standard_value']!r}")
+    return values
+```
+
+### 검증
+
+`mock_harness.py`에 `BadActivityDrug`를 추가해서 활성값 목록에 `"Not Determined"`를 섞어넣고
+가짜 모델·진짜 ADMET-AI 양쪽 다 재실행 — 문제 레코드 하나만 `[건너뜀]` 로그 남기고 스킵된 뒤
+나머지 정상 값들로 효능 판정이 정상적으로 계산됨을 확인했다 (`효능_판정: 효력_부족`,
+백분위 100.0 — 남은 값들 기준으로 정상 계산됨). 전체 19개 화합물 배치와 기존 오프라인
+단위 테스트 모두 재실행해서 회귀 없음을 재확인했다.
+
+## 13. 다음 단계 제안
 
 1. 네트워크가 열린 환경(Colab, 로컬 등)에서 위 "실행 방법"으로 10개 화합물 배치 실행
 2. 에러가 나면 `_with_retry`/`_run_mmpdb`/`deeppk_predict`가 남기는 로그(화합물명 + 실제 응답/에러
