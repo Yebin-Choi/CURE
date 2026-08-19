@@ -194,7 +194,36 @@ ChEMBL/Deep-PK를 실제로 못 부르는 대신, **ChEMBL/ADMET-AI/Deep-PK 호�
 보인다. 불확실한 지점 두 개(`mechanism.filter(molecule_chembl_id=...)` 방향, `standard_units`)만
 네트워크가 열리면 첫 실행에서 우선 확인.
 
-## 8. 다음 단계 제안
+## 8. Deep-PK API 사전 검증 (공식 문서 접근 불가 — 부분 확인)
+
+`biosig.lab.uq.edu.au`는 egress 정책상 WebFetch로도 직접 열리지 않아 (`EGRESS_BLOCKED`), 공식
+API 문서(`/deeppk/api_docs`)를 직접 확인하지 못했다. 웹 검색 스니펫으로 확인 가능했던 것과
+확인 못 한 것을 구분해서 기록한다.
+
+### `pred_type="toxicity"` (소문자) — 코드 수정 안 함, 맞을 가능성 높음
+
+검색으로 확인된 공식 curl 예제: `curl .../deeppk/api/predict -X POST -F smiles="..." -F
+pred_type="admet"`. UI에는 "ADMET"이라고 표시되지만 실제 API 파라미터는 소문자로 보내는
+패턴이 확인됐다. 같은 규칙이면 UI 표시가 "Toxicity"여도 API 파라미터는 소문자 `"toxicity"`일
+가능성이 높다 — 지금 `deeppk_predict()`가 보내는 값과 일치한다. **이 부분은 근거가 있다고
+판단해 코드를 바꾸지 않았다.**
+
+### `DEEPPK_KEY_MAP`의 키 형식 — 확인 불가, 여전히 리스크로 남김
+
+검색 스니펫 하나(AI가 요약한 것으로, 원문 그대로의 인용은 아님)에서 Deep-PK 응답이 "SMILES,
+Predictions (예: `general_properties_bp`류 속성), Probability, Interpretation" 형태의 컬럼으로
+구성된다는 설명을 봤다. 이건 지금 코드가 가정하는 `"[Toxicity/Liver Injury I (DILI)] Predictions"`
+같은 사람이 읽는 괄호 문자열이 아니라, **`toxicity_dili`처럼 카테고리 접두어 + snake_case 키일
+가능성**을 시사한다.
+
+다만 이 정보의 출처가 검색 요약(1차 문서 원문 인용 아님)이라 신뢰도가 낮고, 확정할 근거가
+부족하다고 판단했다. **잘못된 추측으로 `DEEPPK_KEY_MAP`을 고치는 게 지금 상태를 유지하는 것보다
+위험할 수 있어 코드는 그대로 뒀다.** 대신 이미 적용된 방어 코드(`deeppk_predict()`, 4번 항목
+참고)가 이 리스크에 대비돼 있다 — 키가 실제와 다르면 조용히 죽는 대신 실제 응답 구조를 그대로
+에러 메시지에 노출하므로, 네트워크가 열려 hERG/DILI 화합물을 처음 돌릴 때 이 부분이 틀렸다면
+바로 확인되고 고치기 쉽다.
+
+## 9. 다음 단계 제안
 
 1. 네트워크가 열린 환경(Colab, 로컬 등)에서 위 "실행 방법"으로 10개 화합물 배치 실행
 2. 에러가 나면 `_with_retry`/`_run_mmpdb`/`deeppk_predict`가 남기는 로그(화합물명 + 실제 응답/에러
