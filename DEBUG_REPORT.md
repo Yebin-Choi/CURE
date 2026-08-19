@@ -174,25 +174,26 @@ ChEMBL/Deep-PK를 실제로 못 부르는 대신, **ChEMBL/ADMET-AI/Deep-PK 호�
 `python mock_harness.py`로 바로 재실행 가능하고, `RAW_COMPOUNDS`/`FORCED_PRIMARY` 딕셔너리에
 화합물이나 시나리오를 더 추가하면 된다.
 
-## 7. ChEMBL API 필드명 사전 검증 (공식 문서/소스 기반)
+## 7. ChEMBL API 필드명 사전 검증 (1차 소스 기반 — 패키지 자체 테스트 코드)
 
-실제 API를 호출할 수 없어서, 대신 ChEMBL 공식 GitHub 저장소
-(`chembl/chembl_webresource_client`의 `test_docs_examples.py`, `chembl/notebooks`의
-학습용 노트북)에 있는 실제 예제 코드와 검증된 응답 필드를 웹 검색으로 대조했다.
+웹 검색 요약만으로는 신뢰도가 부족한 항목이 있어서, `chembl_webresource_client` 패키지의
+sdist(`pip download --no-binary`)를 직접 받아 그 안에 들어있는 **패키지 자체 테스트 코드**
+(`tests.py`, `test_docs_examples.py` — 실제 라이브 API에 대고 도는 검증된 assertion들)를
+읽었다. 이건 웹 검색 요약이 아니라 ChEMBL 공식 저장소가 배포하는 1차 소스라 신뢰도가 가장 높다.
 
 | 코드가 쓰는 필드 | 호출 위치 | 검증 결과 |
 |---|---|---|
-| `molecule_chembl_id` | `molecule.search()` → `get_chembl_id()` | ✅ 공식 예제로 확인 |
-| `molecule_structures.canonical_smiles` | `molecule.get()` → `get_smiles()` | ✅ 공식 예제로 확인 (nested 구조 포함) |
-| `target_chembl_id` | `mechanism.filter(molecule_chembl_id=...)` → `run_agent0_1()` | ✅ 필드 자체는 mechanism 레코드에 존재 확인. ⚠️ 공식 예제는 반대 방향(`target_chembl_id`로 필터링)만 보여줌 — `molecule_chembl_id`로 필터링하는 예제는 못 찾음. 필드가 있으니 동작할 가능성이 높지만 **네트워크 열리면 제일 먼저 결과가 비어있지 않은지 확인 권장** |
-| `standard_value`, `pchembl_value`, `standard_type` | `activity.filter()` → `get_own_activity()`, `get_target_activities()` | ✅ 공식 예제로 확인 |
-| `standard_units` | 같은 activity 필터 | ⚠️ 이번 검색에서 직접 인용된 예제를 못 찾음 (관용적으로 잘 알려진 필드라 신뢰도는 높음) |
-| `molecule_chembl_id`, `similarity` | `similarity.filter(smiles=..., similarity=...)` → `get_similar_compounds()` | ✅ 공식 예제로 정확히 이 두 필드로 확인 |
-| `pref_name` | `target.get()` → `get_target_name()` (현재 파이프라인에서 미사용) | molecule.get() 응답엔 있음 확인. target 리소스도 ChEMBL 관례상 동일 필드를 가짐. 이 함수 자체가 죽은 코드라 우선순위 낮음 |
+| `molecule_chembl_id` | `molecule.search()` → `get_chembl_id()` | ✅ `test_get_by_chembl_id` 등에서 `m1['molecule_chembl_id']`로 직접 확인 |
+| `molecule_structures.canonical_smiles` | `molecule.get()` → `get_smiles()` | ✅ `test_get_all_natural_products`에서 `d['molecule_structures']['canonical_smiles']`로 직접 확인 |
+| `mechanism.filter(molecule_chembl_id=...)` → `target_chembl_id` | `run_agent0_1()` | ✅ **완전히 확인됨**. `tests.py::test_mechanism_resource`가 mechanism 레코드에 `molecule_chembl_id`·`target_chembl_id` 두 필드가 다 있음을 `assertIn`으로 직접 검증하고, 같은 테스트에서 `mechanism.filter(action_type=...)`처럼 `.filter()`가 임의 필드에 대해 범용으로 동작함을 보여준다. 이전에 "반대 방향 예제만 있어 불확실"이라 했던 것을 철회 — 방향 무관하게 정상 동작할 것 |
+| `standard_value`, `pchembl_value`, `standard_type` | `activity.filter()` → `get_own_activity()`, `get_target_activities()` | ✅ `test_pChembl`, `test_get_pChembl_for_compound_and_target`(정확히 `molecule_chembl_id`+`target_chembl_id` 동시 필터 — `get_own_activity()`와 같은 패턴), `test_get_ki_activities_for_herg`(`target_chembl_id`만 필터 후 `standard_value` — `get_target_activities()`와 같은 패턴)에서 확인 |
+| `standard_units` | 같은 activity 필터 | ✅ **확인됨**. `tests.py` 초반에 주석 처리된 필드 검증 블록에 `assertIn('standard_units', ...)`이 명시돼 있어 실제 activity 리소스 필드임이 확인됨 (그 테스트 블록 전체가 비활성화된 이유는 별개 — 아마 느려서/API 부하 때문으로 보이고, 필드 존재 자체와는 무관) |
+| `molecule_chembl_id`, `similarity` | `similarity.filter(smiles=..., similarity=...)` → `get_similar_compounds()` | ✅ `test_similarity_85`, `test_similarity_70`에서 정확히 확인 (참고: `similarity` 값은 문자열로 옴, 예: `'100'` — 코드에서 이 값을 직접 안 쓰므로 문제없음) |
+| `pref_name` | `target.get()` → `get_target_name()` (현재 파이프라인에서 미사용) | ✅ `molecule.get()` 결과에서 확인. 이 함수 자체가 죽은 코드라 우선순위 낮음 |
 
-**결론**: Deep-PK 응답 키(`DEEPPK_KEY_MAP`)와 달리 ChEMBL 필드명은 코드가 이미 정확한 것으로
-보인다. 불확실한 지점 두 개(`mechanism.filter(molecule_chembl_id=...)` 방향, `standard_units`)만
-네트워크가 열리면 첫 실행에서 우선 확인.
+**결론**: ChEMBL 쪽 필드명은 전부 1차 소스로 확인 완료 — 더 이상 불확실한 지점 없음. 이전
+리포트에서 "우선 확인 권장"으로 남겨뒀던 두 항목(mechanism 필터 방향, standard_units)은 모두
+해소됐다.
 
 ## 8. Deep-PK API 사전 검증 (공식 문서 접근 불가 — 부분 확인)
 
